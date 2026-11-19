@@ -39,11 +39,12 @@ def send_long(chat_id: int, text: str, parse_mode: str = None):
         chunk = text[i:i + MAX_MSG]
         try:
             bot.send_message(chat_id, chunk, parse_mode=parse_mode, disable_web_page_preview=True)
-        except Exception:
+        except Exception as e:
+            print(f"Ошибка отправки HTML: {e}. Пробую plain text.")
             try:
                 bot.send_message(chat_id, chunk, disable_web_page_preview=True)
-            except Exception as e:
-                print(f"Не удалось отправить кусок: {e}")
+            except Exception as e2:
+                print(f"Ошибка отправки plain text: {e2}")
 
 # ============================================================
 # GROQ: текст + vision
@@ -65,6 +66,7 @@ def ask_groq_agent(prompt: str, context: str = "") -> str:
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
+        print(f"Groq API Error: {e}")
         return f"Ошибка Groq (текст): {e}"
 
 def analyze_image_with_qwen(image_bytes: bytes, query: str = "Опиши изображение.") -> str:
@@ -86,6 +88,7 @@ def analyze_image_with_qwen(image_bytes: bytes, query: str = "Опиши изо�
         )
         return r.choices[0].message.content
     except Exception as e:
+        print(f"Groq Vision Error: {e}")
         return f"Ошибка Groq (vision): {e}"
 
 # ============================================================
@@ -164,8 +167,9 @@ def phone_osint_queries(phone: str) -> list:
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
+    print(f"Обработка /start от {message.chat.id}")
     bot.reply_to(message,
-        "👋 doks-бот (делаю полный докс ).\n\n"
+        "👋 OSINT-бот (только открытые источники).\n\n"
         "/nick username — поиск по нику\n"
         "/domain example.com — WHOIS\n"
         "/phone +79001234567 — быстрые ссылки\n"
@@ -355,7 +359,7 @@ def cmd_photo(message):
         process_doks(message, caption.replace("/doks", "").strip(), has_photo=True)
         return
 
-    bot.reply_to(message, "📸 Анализирую через chatGPT…")
+    bot.reply_to(message, "📸 Анализирую через Qwen…")
     try:
         file_id = message.photo[-1].file_id
         info = bot.get_file(file_id)
@@ -382,20 +386,31 @@ def index():
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    if request.headers.get("content-type") == "application/json":
-        update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+    print("!!! ПОЛУЧЕН ЗАПРОС ОТ TELEGRAM !!!") # ЭТО ПОКАЖЕТ, ДОХОДИТ ЛИ ВЕБХУК
+    if request.mimetype == "application/json": # ИСПРАВЛЕНО ТУТ
+        json_string = request.get_data().decode("utf-8")
+        print(f"JSON: {json_string[:100]}...")
+        update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return "", 200
-    return "Forbidden", 403
+    else:
+        print(f"Неверный тип контента: {request.mimetype}")
+        return "Forbidden", 403
 
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook():
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if not url:
         return "RENDER_EXTERNAL_URL not set", 400
+    
+    # Удаляем старый и ставим новый
     bot.remove_webhook()
-    bot.set_webhook(url=f"{url}/{BOT_TOKEN}")
-    return f"Webhook set: {url}", 200
+    success = bot.set_webhook(url=f"{url}/{BOT_TOKEN}")
+    
+    if success:
+        return f"Webhook успешно установлен на: {url}/{BOT_TOKEN}", 200
+    else:
+        return "Ошибка установки вебхука", 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
