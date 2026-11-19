@@ -1,6 +1,6 @@
 pyTelegramBotAPI
 requests
-beautifulsoup4
 python-whois
-Flask
+flask
+groq
 gunicorn
