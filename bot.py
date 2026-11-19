@@ -3,7 +3,6 @@ import re
 import json
 import html
 import base64
-import threading
 import traceback
 import requests
 import whois
@@ -18,11 +17,6 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN', '9082313783:AAG0d10RC63ZTy66xV4nXlfcDp6Q
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
 
-print("=== СТАРТ БОТА ===")
-print(f"BOT_TOKEN задан: {bool(BOT_TOKEN)}")
-print(f"GROQ_API_KEY задан: {bool(GROQ_API_KEY)}")
-print(f"SERPER_API_KEY задан: {bool(SERPER_API_KEY)}")
-
 if not BOT_TOKEN:
     raise ValueError("Не установлен BOT_TOKEN")
 
@@ -35,26 +29,56 @@ MAX_MSG = 4000
 # ============================================================
 # УТИЛИТЫ
 # ============================================================
+
 def escape_html(text: str) -> str:
     return html.escape(str(text), quote=False)
 
+def command_args(message) -> str:
+    """Извлекает аргументы команды, игнорируя @имя_бота"""
+    parts = (message.text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
 def send_long(chat_id: int, text: str, parse_mode: str = None):
+    """Безопасная отправка сообщений с защитой от разрыва HTML-тегов."""
     if not text:
         return
-    for i in range(0, len(text), MAX_MSG):
-        chunk = text[i:i + MAX_MSG]
-        try:
-            bot.send_message(chat_id, chunk, parse_mode=parse_mode, disable_web_page_preview=True)
-        except Exception as e:
-            print(f"Ошибка HTML: {e}")
+
+    # Обычный текст
+    if parse_mode != "HTML":
+        for i in range(0, len(text), MAX_MSG):
+            chunk = text[i:i + MAX_MSG]
             try:
                 bot.send_message(chat_id, chunk, disable_web_page_preview=True)
-            except Exception as e2:
-                print(f"Ошибка plain: {e2}")
+            except Exception as e:
+                print(f"Ошибка отправки: {e}")
+        return
+
+    # HTML-режим
+    if len(text) > MAX_MSG:
+        # Если текст длинный, срезаем теги, чтобы не сломать разметку
+        text = re.sub(r"<[^>]*>", "", text)
+        text = html.unescape(text)
+        for i in range(0, len(text), MAX_MSG):
+            try:
+                bot.send_message(chat_id, text[i:i + MAX_MSG], disable_web_page_preview=True)
+            except Exception as e:
+                print(f"Ошибка отправки plain: {e}")
+        return
+
+    try:
+        bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        print(f"Ошибка HTML: {e}")
+        plain = html.unescape(re.sub(r"<[^>]*>", "", text))
+        try:
+            bot.send_message(chat_id, plain, disable_web_page_preview=True)
+        except Exception as e2:
+            print(f"Ошибка fallback: {e2}")
 
 # ============================================================
-# GROQ / SERPER
+# GROQ: текст + vision
 # ============================================================
+
 def ask_groq_agent(prompt: str, context: str = "") -> str:
     if not groq_client:
         return "Ошибка: GROQ_API_KEY не настроен."
@@ -62,7 +86,7 @@ def ask_groq_agent(prompt: str, context: str = "") -> str:
     try:
         r = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Ты — OSINT-ассистент."},
+                {"role": "system", "content": "Ты — OSINT-ассистент. Работаешь только с публично доступной информацией."},
                 {"role": "user", "content": full},
             ],
             model="openai/gpt-oss-120b",
@@ -96,6 +120,10 @@ def analyze_image_with_qwen(image_bytes: bytes, query: str = "Опиши изо�
         print(f"Qwen Error: {e}")
         return f"Ошибка Qwen: {e}"
 
+# ============================================================
+# SERPER
+# ============================================================
+
 def search_google(query: str, num: int = 5) -> list:
     if not SERPER_API_KEY:
         return []
@@ -125,8 +153,19 @@ def results_to_html(query: str, results: list) -> str:
         return ""
     out = f"🔎 <b>{escape_html(query)}</b>\n"
     for item in results:
-        out += f'• <a href="{item.get("link","")}">{escape_html(item.get("title",""))}</a>\n{escape_html(item.get("snippet",""))}\n\n'
+        title = escape_html(item.get("title", ""))
+        snippet = escape_html(item.get("snippet", ""))
+        url = html.escape(str(item.get("link", "")), quote=True)
+
+        if not url.startswith(("https://", "http://")):
+            out += f"• {title}\n{snippet}\n\n"
+            continue
+        out += f'• <a href="{url}">{title}</a>\n{snippet}\n\n'
     return out
+
+# ============================================================
+# ТЕЛЕФОН
+# ============================================================
 
 def normalize_phone(phone: str) -> str:
     digits = re.sub(r"\D", "", phone)
@@ -146,6 +185,7 @@ def phone_osint_queries(phone: str) -> list:
     for f in formats:
         queries.append(f'"{f}"')
         queries.append(f'"{f}" (site:vk.com OR site:ok.ru OR site:avito.ru OR site:t.me)')
+    queries += [f'"{phone}" объявления', f'"{phone}" whatsapp', f'"{phone}" telegram']
     seen, uniq = set(), []
     for q in queries:
         if q not in seen:
@@ -156,52 +196,22 @@ def phone_osint_queries(phone: str) -> list:
 # ============================================================
 # КОМАНДЫ
 # ============================================================
+
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
-    print(f"!!! /start от {message.chat.id} !!!")
-    # Отправляем диагностику
-    diag = (
-        f"✅ Бот живой.\n\n"
-        f"GROQ_API_KEY: {'✅ есть' if GROQ_API_KEY else '❌ НЕТ'}\n"
-        f"SERPER_API_KEY: {'✅ есть' if SERPER_API_KEY else '❌ НЕТ'}\n"
-        f"Groq-клиент: {'✅ создан' if groq_client else '❌ не создан'}\n"
-        f"Модель текста: openai/gpt-oss-120b\n"
-        f"Модель фото: qwen/qwen3.8-27b\n\n"
-        f"Команды:\n"
-        f"/nick username — поиск по нику\n"
-        f"/domain example.com — WHOIS\n"
-        f"/phone +79001234567 — ссылки\n"
-        f"/phone_osint +79001234567 — глубокий поиск\n"
-        f"/doks <запрос> — каскадный поиск (можно фото с подписью /doks)\n"
-        f"/test_groq — проверить Groq\n"
-        f"/test_serper — проверить Serper\n"
-        f"/test_photo — инструкция по фото\n\n"
-        f"Отправь фото — проанализирую через Qwen."
+    bot.reply_to(message,
+        "👋 OSINT-бот (только открытые источники).\n\n"
+        "/nick username — поиск по нику\n"
+        "/domain example.com — WHOIS\n"
+        "/phone +79001234567 — быстрые ссылки\n"
+        "/phone_osint +79001234567 — глубокий поиск\n"
+        "/doks <запрос> — каскадный поиск (можно фото с подписью /doks)\n\n"
+        "Отправь фото — проанализирую через Qwen."
     )
-    bot.reply_to(message, diag)
-
-@bot.message_handler(commands=["test_groq"])
-def cmd_test_groq(message):
-    bot.reply_to(message, "Тестирую Groq...")
-    result = ask_groq_agent("Скажи ровно одно слово: РАБОТАЕТ")
-    bot.reply_to(message, f"Ответ Groq:\n{result}")
-
-@bot.message_handler(commands=["test_serper"])
-def cmd_test_serper(message):
-    bot.reply_to(message, "Тестирую Serper...")
-    r = search_google("test query", num=1)
-    if r:
-        bot.reply_to(message, f"Serper ✅ Найдено {len(r)} результатов")
-    else:
-        bot.reply_to(message, "Serper ❌ 0 результатов (ключ неверный или кончился лимит)")
-
-@bot.message_handler(commands=["test_photo"])
-def cmd_test_photo(message):
-    bot.reply_to(message, "Отправь фото с подписью /doks или без — проанализирую.")
 
 @bot.message_handler(commands=["nick"])
 def cmd_nick(message):
-    nick = message.text.replace("/nick", "").strip()
+    nick = command_args(message)
     if not nick:
         bot.reply_to(message, "Напиши ник: /nick username")
         return
@@ -218,12 +228,12 @@ def cmd_nick(message):
             r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
             out += f"{'✅' if r.status_code == 200 else '❌'} {site}: {url}\n"
         except Exception:
-            out += f"⚠️ {site}: ошибка\n"
+            out += f"⚠️ {site}: ошибка сети\n"
     send_long(message.chat.id, out, parse_mode="HTML")
 
 @bot.message_handler(commands=["domain"])
 def cmd_domain(message):
-    domain = message.text.replace("/domain", "").strip()
+    domain = command_args(message)
     if not domain:
         bot.reply_to(message, "Напиши домен: /domain example.com")
         return
@@ -238,11 +248,11 @@ def cmd_domain(message):
         )
         send_long(message.chat.id, out, parse_mode="HTML")
     except Exception as e:
-        bot.reply_to(message, f"❌ WHOIS: {e}")
+        bot.reply_to(message, f"❌ WHOIS ошибка: {e}")
 
 @bot.message_handler(commands=["phone"])
 def cmd_phone(message):
-    raw = message.text.replace("/phone", "").strip()
+    raw = command_args(message)
     if not raw:
         bot.reply_to(message, "Напиши: /phone +79001234567")
         return
@@ -258,20 +268,27 @@ def cmd_phone(message):
 
 @bot.message_handler(commands=["phone_osint"])
 def cmd_phone_osint(message):
-    raw = message.text.replace("/phone_osint", "").strip()
+    raw = command_args(message)
     if not raw:
         bot.reply_to(message, "Напиши: /phone_osint +79001234567")
         return
     phone = normalize_phone(raw)
     bot.reply_to(message, f"🕵️ Поиск упоминаний <b>{escape_html(phone)}</b>…", parse_mode="HTML")
+
     all_plain, all_html = "", ""
+    found_any = False
+
     for q in phone_osint_queries(phone):
         r = search_google(q)
+        if r:
+            found_any = True
         all_plain += results_to_plain(q, r)
         all_html += results_to_html(q, r)
-    if not all_plain.strip():
+
+    if not found_any:
         bot.reply_to(message, "❌ Ничего не найдено.")
         return
+
     bot.reply_to(message, "🧠 Анализирую…")
     report = ask_groq_agent(
         prompt=f"Номер: {phone}. Публичные упоминания:\n{all_plain}\n\nСоставь OSINT-отчёт: имена/ники/компании, площадки, регион, пробелы."
@@ -279,79 +296,121 @@ def cmd_phone_osint(message):
     send_long(message.chat.id, f"📋 ОТЧЁТ:\n\n{report}")
     send_long(message.chat.id, f"🔗 <b>Источники:</b>\n\n{all_html}", parse_mode="HTML")
 
+# ============================================================
 # /doks
+# ============================================================
+
 def process_doks(message, user_query: str, has_photo: bool):
     chat_id = message.chat.id
     image_context = ""
+
     if has_photo:
-        bot.reply_to(message, "📸 Анализирую фото…")
+        bot.reply_to(message, "📸 Фото получено. Анализирую через Qwen…")
         try:
             file_id = message.photo[-1].file_id
             info = bot.get_file(file_id)
             data = bot.download_file(info.file_path)
-            image_context = analyze_image_with_qwen(data, query="Опиши всё: OCR, лица, номера, адреса, вывески.")
+            image_context = analyze_image_with_qwen(
+                data,
+                query="Опиши всё на фото: текст (OCR), лица, номера, адреса, вывески, логотипы."
+            )
         except Exception as e:
-            image_context = f"Ошибка фото: {e}"
+            image_context = f"Ошибка анализа фото: {e}"
+
     if not user_query and not image_context:
         bot.reply_to(message, "Напиши запрос или приложи фото с подписью /doks.")
         return
+
     bot.reply_to(message, "🕵️ Этап 1: первичный поиск…")
+
     base = user_query or "фото"
-    qraw = ask_groq_agent(f"Сгенерируй 5 поисковых запросов по: {base}. Контекст фото: {image_context[:400]}")
+    qraw = ask_groq_agent(
+        f"Сгенерируй 5 поисковых запросов для открытой информации по теме: {base}. "
+        f"Контекст из фото: {image_context[:400]}"
+    )
     queries = [q.strip(" -•*0123456789.") for q in qraw.split("\n") if q.strip()][:5]
+
     all_plain = image_context + "\n\n" if image_context else ""
-    all_html = (f"<b>📸 Фото:</b>\n{escape_html(image_context)}\n\n" if image_context else "")
+    all_html = (f"<b>📸 Анализ фото:</b>\n{escape_html(image_context)}\n\n" if image_context else "")
+    
+    found_any = False
     for q in queries:
         r = search_google(q)
+        if r:
+            found_any = True
         all_plain += results_to_plain(q, r)
         all_html += results_to_html(q, r)
-    if len(all_plain.strip()) < 50:
-        bot.reply_to(message, "❌ Поиск пуст.")
+
+    if not found_any and not image_context:
+        bot.reply_to(message, "❌ Поиск не дал результатов.")
         return
+
     bot.reply_to(message, "🧠 Этап 2: углубление…")
-    analysis = ask_groq_agent(f"Данные:\n{all_plain}\n\nНайди имя/ник. Если есть — 3 уточняющих запроса. Если нет — «НЕТ ДАННЫХ».")
+    analysis = ask_groq_agent(
+        f"Данные:\n{all_plain}\n\n"
+        "Найди возможное имя/ник/компанию. Если нашёл — предложи 3 уточняющих запроса "
+        "(только список, без пояснений). Если нет — ответь ровно «НЕТ ДАННЫХ»."
+    )
+
     if "НЕТ ДАННЫХ" not in analysis and "Ошибка" not in analysis:
         deep = [q.strip(" -•*0123456789.") for q in analysis.split("\n") if q.strip()][:3]
         for q in deep:
             r = search_google(q)
+            if r:
+                found_any = True
             all_plain += results_to_plain(q, r)
             all_html += results_to_html(q, r)
-    bot.reply_to(message, "🧠 Этап 3: отчёт…")
-    report = ask_groq_agent(prompt="Составь OSINT-отчёт по данным. Не выдумывай.", context=all_plain)
+
+    bot.reply_to(message, "🧠 Этап 3: финальный отчёт…")
+    report = ask_groq_agent(
+        prompt="Составь OSINT-отчёт по этим данным. Выдели находки и пробелы. Не выдумывай.",
+        context=all_plain,
+    )
+
     send_long(chat_id, f"📋 ОТЧЁТ:\n\n{report}")
     if all_html.strip():
         send_long(chat_id, f"🔗 <b>Источники:</b>\n\n{all_html}", parse_mode="HTML")
 
 @bot.message_handler(commands=["doks"])
 def cmd_doks(message):
-    process_doks(message, message.text.replace("/doks", "").strip(), has_photo=False)
+    process_doks(message, command_args(message), has_photo=False)
+
+# ============================================================
+# ФОТО
+# ============================================================
 
 @bot.message_handler(content_types=["photo"])
 def cmd_photo(message):
     caption = (message.caption or "").strip()
     if caption.startswith("/doks"):
-        process_doks(message, caption.replace("/doks", "").strip(), has_photo=True)
+        # Извлекаем текст из подписи (например, "/doks тест" -> "тест")
+        query = caption.replace("/doks", "").strip()
+        process_doks(message, query, has_photo=True)
         return
-    bot.reply_to(message, "📸 Анализирую…")
+
+    bot.reply_to(message, "📸 Анализирую через Qwen…")
     try:
         file_id = message.photo[-1].file_id
         info = bot.get_file(file_id)
         data = bot.download_file(info.file_path)
-        result = analyze_image_with_qwen(data, query="Опиши всё. OCR, лица, номера, адреса, вывески.")
+        result = analyze_image_with_qwen(
+            data,
+            query="Опиши подробно изображение. Распознай текст (OCR). Перечисли наблюдаемые признаки."
+        )
         send_long(message.chat.id, result)
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка фото: {e}")
 
 # ============================================================
-# ВЕБХУК + ДИАГНОСТИКА
+# ВЕБХУК ДЛЯ RENDER
 # ============================================================
+
 @app.route("/", methods=["GET"])
 def index():
     return "Bot is alive!"
 
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    print("!!! ПОЛУЧЕН WEBHOOK !!!")
     try:
         if request.mimetype == "application/json":
             json_string = request.get_data().decode("utf-8")
@@ -360,7 +419,7 @@ def webhook():
             return "", 200
         return "Forbidden", 403
     except Exception as e:
-        print(f"ОШИБКА ОБРАБОТКИ: {e}")
+        print(f"ОШИБКА ОБРАБОТКИ ВЕБХУКА: {e}")
         traceback.print_exc()
         return "Error", 500
 
@@ -368,20 +427,13 @@ def webhook():
 def set_webhook():
     url = os.environ.get("RENDER_EXTERNAL_URL")
     if not url:
-        return "RENDER_EXTERNAL_URL not set", 400
+        return "RENDER_EXTERNAL_URL не установлен", 400
     bot.remove_webhook()
     success = bot.set_webhook(url=f"{url}/{BOT_TOKEN}")
     if success:
-        return f"✅ Webhook установлен: {url}/{BOT_TOKEN}"
-    return "❌ Ошибка установки", 500
-
-@app.route("/webhook_info", methods=["GET"])
-def webhook_info():
-    return str(bot.get_webhook_info())
-
-@app.route("/test", methods=["GET"])
-def test_route():
-    return f"OK. GROQ={bool(GROQ_API_KEY)}, SERPER={bool(SERPER_API_KEY)}"
+        return f"✅ Webhook успешно установлен: {url}/{BOT_TOKEN}", 200
+    else:
+        return "❌ Ошибка установки вебхука", 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
