@@ -3,6 +3,7 @@ import re
 import json
 import html
 import base64
+import threading
 import requests
 import whois
 import telebot
@@ -19,7 +20,8 @@ SERPER_API_KEY = os.environ.get('SERPER_API_KEY')
 if not BOT_TOKEN:
     raise ValueError("Не установлен BOT_TOKEN")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# threaded=False важно для работы в связке с Flask
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False) 
 app = Flask(__name__)
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -377,40 +379,34 @@ def cmd_photo(message):
         bot.reply_to(message, f"❌ Ошибка фото: {e}")
 
 # ============================================================
-# RENDER WEBHOOK
+# FLASK (ДЛЯ RENDER) + POLLING (ДЛЯ РАБОТЫ)
 # ============================================================
 
 @app.route("/", methods=["GET"])
 def index():
     return "Bot is alive!"
 
+# Оставляем вебхук на случай, если захочешь переключиться обратно (но мы его удалим при старте)
 @app.route(f"/{BOT_TOKEN}", methods=["POST"])
 def webhook():
-    print("!!! ПОЛУЧЕН ЗАПРОС ОТ TELEGRAM !!!") # ЭТО ПОКАЖЕТ, ДОХОДИТ ЛИ ВЕБХУК
-    if request.mimetype == "application/json": # ИСПРАВЛЕНО ТУТ
-        json_string = request.get_data().decode("utf-8")
-        print(f"JSON: {json_string[:100]}...")
-        update = telebot.types.Update.de_json(json_string)
+    if request.mimetype == "application/json":
+        update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
         bot.process_new_updates([update])
         return "", 200
-    else:
-        print(f"Неверный тип контента: {request.mimetype}")
-        return "Forbidden", 403
+    return "Forbidden", 403
 
-@app.route("/set_webhook", methods=["GET"])
-def set_webhook():
-    url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not url:
-        return "RENDER_EXTERNAL_URL not set", 400
-    
-    # Удаляем старый и ставим новый
+def run_polling():
+    print("=== ЗАПУСК LONG POLLING ===")
+    # Удаляем вебхук, чтобы Telegram не пытался стучаться на Flask
     bot.remove_webhook()
-    success = bot.set_webhook(url=f"{url}/{BOT_TOKEN}")
-    
-    if success:
-        return f"Webhook успешно установлен на: {url}/{BOT_TOKEN}", 200
-    else:
-        return "Ошибка установки вебхука", 500
+    # Запускаем бесконечный опрос
+    bot.infinity_polling(skip_pending=True, timeout=20)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Запускаем бота в отдельном потоке
+    t = threading.Thread(target=run_polling, daemon=True)
+    t.start()
+    
+    # Запускаем Flask (нужен Render'у, чтобы сервис не падал)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
